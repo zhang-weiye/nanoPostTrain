@@ -30,6 +30,7 @@ def format_bytes(value):
         return "--"
 
     value = float(value)
+
     for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
         if abs(value) < 1024 or unit == "TiB":
             return f"{value:.1f} {unit}"
@@ -50,75 +51,60 @@ def format_time(seconds):
 # ── Layer 1: Statistics ───────────────────────────────────────
 
 class ProgressTracker:
-    """Track the download plan; tqdm handles live speed and ETA."""
+    """Use tqdm's native network speed to estimate remaining time."""
 
     def __init__(self, plan):
         self.pending = [f for f in plan if f.will_download]
-        self.total_files = len(plan)
-        self.cached_files = len(plan) - len(self.pending)
-        self.revision = plan[0].commit_hash if plan else None
-
         sizes = [f.file_size for f in self.pending]
+
         self.total_bytes = (
-            sum(sizes)
-            if all(size is not None for size in sizes)
+            sum(sizes) if all(s is not None for s in sizes) else None
+        )
+
+    def snapshot(self, bar):
+        received = bar.n
+        speed = bar.format_dict.get("rate")
+        total = self.total_bytes
+
+        # Xet transfer bytes may differ from logical file sizes.
+        ratio = min(received / total, 0.99) if total else None
+
+        eta = (
+            (total - received) / speed
+            if total and speed and speed > 0 and received < total
             else None
         )
+
+        return received, speed, ratio, eta
 
 
 # ── Layer 2: Rendering ────────────────────────────────────────
 
 class ProgressRenderer:
-    """Configure native tqdm formatting."""
-
-    FORMATS = {
-        "network": (
-            "{desc:<9} {n_fmt}B | {rate_fmt}"
-        ),
-        "overall": (
-            "{desc:<9} {percentage:5.1f}% |{bar:18u}| "
-            "{n_fmt}B/{total_fmt}B | {rate_fmt} | ETA {remaining}"
-        ),
-        "files": (
-            "{desc:<9} |{bar:18u}| {n_fmt}/{total_fmt}"
-        ),
-    }
-
-    UNKNOWN = "{desc:<9} {n_fmt}B processed | {rate_fmt}"
+    WIDTH = 14
 
     @classmethod
-    def configure(cls, kind, kwargs, tracker):
-        known_total = tracker and tracker.total_bytes is not None
+    def render(cls, stats):
+        received, speed, ratio, eta = stats
 
-        kwargs.update(
-            desc=kind.title(),
-            bar_format=(
-                cls.UNKNOWN
-                if kind == "overall" and not known_total
-                else cls.FORMATS[kind]
-            ),
-            ascii=False,
-            dynamic_ncols=True,
-            mininterval=0.5,
-            smoothing=0.3,
-            leave=False,
+        # Approximate progress: actual network total is unknown.
+        if ratio is not None:
+            filled = round(cls.WIDTH * ratio)
+            bar = "█" * filled + "░" * (cls.WIDTH - filled)
+            progress = f"~{ratio:.1%}"
+        else:
+            bar = "░" * cls.WIDTH
+            progress = "unknown"
+
+        rate = f"{format_bytes(speed)}/s" if speed else "--"
+        remaining = f"~{format_time(eta)}" if eta is not None else "--"
+
+        return (
+            f"Downloading {bar} {progress}"
+            f" | {format_bytes(received)}"
+            f" | {rate}"
+            f" | ETA {remaining}"
         )
-
-        if kind in ("network", "overall"):
-            kwargs["unit_divisor"] = 1024
-
-    @staticmethod
-    def show_plan(tracker):
-        print(
-            f"Files: {tracker.cached_files}/{tracker.total_files} cached, "
-            f"{len(tracker.pending)} pending"
-        )
-        print(f"Data size: {format_bytes(tracker.total_bytes)}")
-
-    @staticmethod
-    def show_result(path, elapsed):
-        print(f"\nCompleted in {format_time(elapsed)}")
-        print(f"Model ready: {path}")
 
 
 # ── Adapter: Hugging Face -> Tracker -> Renderer ──────────────
@@ -129,42 +115,37 @@ class DownloadProgress(tqdm):
     def __init__(self, *args, **kwargs):
         desc = str(kwargs.get("desc") or "").lower()
 
-        # Identify the three progress streams from Hugging Face.
-        if kwargs.get("unit") != "B":
-            self.kind = "files"
-        elif "reconstruct" in desc:
-            self.kind = "overall"
-        else:
-            self.kind = "network"
+        # Only show the network transfer progress.
+        self.is_network = (
+            kwargs.get("unit") == "B" and "download" in desc
+        )
 
-        # DownloadProgress -> ProgressRenderer
-        ProgressRenderer.configure(
-            self.kind, kwargs, self.tracker
+        kwargs.update(
+            position=0,
+            leave=False,
+            mininterval=0.5,
+            smoothing=0.3,
         )
 
         super().__init__(*args, **kwargs)
 
-    @property
-    def format_dict(self):
-        data = super().format_dict
+    def __str__(self):
+        if not self.is_network or self.tracker is None:
+            return super().__str__()
 
-        # Apply preflight total for DISPLAY only.
-        # Never modify tqdm's actual counters.
-        if (
-            self.kind == "overall"
-            and self.tracker is not None
-            and self.tracker.total_bytes is not None
-        ):
-            expected = self.tracker.total_bytes
+        # DownloadProgress -> ProgressTracker -> ProgressRenderer
+        return ProgressRenderer.render(
+            self.tracker.snapshot(self)
+        )
 
-            if data["n"] <= expected:
-                data["total"] = expected
-            else:
-                # The preflight estimate no longer matches.
-                data["total"] = None
-                data["bar_format"] = ProgressRenderer.UNKNOWN
+    def display(self, msg=None, pos=None):
+        # Other tqdm objects still work, but do not write to terminal.
+        if self.is_network:
+            return super().display(msg=msg, pos=pos)
 
-        return data
+    def clear(self, *args, **kwargs):
+        if self.is_network:
+            return super().clear(*args, **kwargs)
 
 
 class SilentProgress(tqdm):
@@ -201,29 +182,48 @@ class Downloader:
 
         # Step3: Initialize the static data tracking.
         tracker = ProgressTracker(plan)
-        ProgressRenderer.show_plan(tracker)
+        cached = len(plan) - len(tracker.pending)
+
+        print(f"Files cached: {cached}/{len(plan)}")
+        print(f"Pending: {len(tracker.pending)} files")
+        print(f"Data size: {format_bytes(tracker.total_bytes)}")
 
         # Early Return if there's no file needing to be downloaded.
         if not tracker.pending:
-            return str(MODEL_DIR.resolve())
+            result = str(MODEL_DIR.resolve())
+        else:
+            # Downloader -> DownloadProgress -> ProgressTracker
+            DownloadProgress.tracker = tracker
 
-        # Downloader -> DownloadProgress -> ProgressTracker
-        DownloadProgress.tracker = tracker
+            # Step4: Start Downloading.
+            result = snapshot_download(
+                **options,
+                revision=plan[0].commit_hash,
+                tqdm_class=DownloadProgress,
+            )
 
-        # Step4: Start Downloading.
-        return snapshot_download(
-            **options,
-            revision=tracker.revision,
-            tqdm_class=DownloadProgress,
-        )
+        # Step5: Check reconstructed model files.
+        print("\nChecking reconstructed files...", flush=True)
+
+        for file in plan:
+            path = Path(file.local_path)
+
+            if not path.is_file():
+                raise RuntimeError(f"Missing file: {path}")
+
+            if file.file_size is not None:
+                if path.stat().st_size != file.file_size:
+                    raise RuntimeError(f"Invalid file size: {path}")
+
+        return result
 
 
-# ── Entry point ───────────────────────────────────────────────
+# ── Entry Point ───────────────────────────────────────────────
 
 def main():
     start = time.monotonic()
 
-    # Avoid warning information disturbing the progress display.
+    # Avoid warnings disturbing the download progress display.
     with logging_redirect_tqdm(
         loggers=[logging.getLogger("huggingface_hub")]
     ):
@@ -231,7 +231,9 @@ def main():
 
     # All process done, print running time and ending signal.
     elapsed = time.monotonic() - start
-    ProgressRenderer.show_result(result, elapsed)
+
+    print(f"Completed: {format_time(elapsed)}")
+    print(f"Model ready: {result}")
 
 
 if __name__ == "__main__":
