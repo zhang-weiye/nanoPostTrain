@@ -223,3 +223,4 @@ __marimo__/
 # Download model parameters
 src/model
 src/modelcp
+src/modelcopy

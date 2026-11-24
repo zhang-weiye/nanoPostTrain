@@ -1,5 +1,5 @@
 
-"""Download Qwen3-1.7B from HF-Mirror into ../modelcp."""
+"""Download Qwen3-1.7B from HF-Mirror into ../modelcopy."""
 
 import os
 
@@ -20,17 +20,18 @@ from tqdm.contrib.logging import logging_redirect_tqdm
 from huggingface_hub import snapshot_download
 
 
-MODEL_DIR = Path(__file__).resolve().parent.parent / "modelcp"
+MODEL_DIR = Path(__file__).resolve().parent.parent / "modelcopy"
 MAX_WORKERS = 8
 
 
-# ── Formatting ────────────────────────────────────────────────
+# ── Formatting Functions ─────────────────────────────────────
 
 def format_bytes(value):
     if value is None:
         return "--"
 
     value = float(value)
+
     for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
         if abs(value) < 1024 or unit == "TiB":
             return f"{value:.1f} {unit}"
@@ -51,7 +52,7 @@ def format_time(seconds):
 # ── Layer 1: Statistics ───────────────────────────────────────
 
 class ProgressTracker:
-    """Manage download progress using tqdm's native speed."""
+    """Track network, reconstruction and file progress."""
 
     def __init__(self, expected_bytes, total_files):
         self.expected_bytes = expected_bytes
@@ -59,6 +60,7 @@ class ProgressTracker:
         self.bars = {}
         self.lock = Lock()
         self.last_refresh = 0.0
+        self.finished = False
 
     def register(self, kind, bar):
         with self.lock:
@@ -71,58 +73,80 @@ class ProgressTracker:
     def should_refresh(self):
         with self.lock:
             now = time.monotonic()
+
             if now - self.last_refresh < 0.5:
                 return False
+
             self.last_refresh = now
             return True
 
+    def finish(self):
+        """Mark completion only after snapshot_download succeeds."""
+        with self.lock:
+            self.finished = True
+
     def snapshot(self):
+        with self.lock:
+            finished = self.finished
+            bars = self.bars.copy()
+
+        # Successful download is the authoritative completion signal.
+        if finished:
+            return {
+                "phase": "Completed",
+                "completed": self.expected_bytes or 0,
+                "total": self.expected_bytes,
+                "network_speed": None,
+                "write_speed": None,
+                "files_done": self.total_files,
+                "files_total": self.total_files,
+                "eta": 0,
+            }
+
         def read(kind):
-            bar = self.get_bar(kind)
+            bar = bars.get(kind)
             if bar is None:
                 return 0, None
 
             data = bar.format_dict
             return data["n"], data.get("rate")
 
-        received, network_speed = read("network")
+        _, network_speed = read("network")
         reconstructed, write_speed = read("overall")
         files_done, _ = read("files")
 
-        # Switch to Overall when reconstruction begins.
-        receiving = reconstructed == 0
-        phase = "Receiving" if receiving else "Overall"
-
-        completed = received if receiving else reconstructed
-        speed = network_speed if receiving else write_speed
-
         total = self.expected_bytes
-        if total is not None and (total <= 0 or completed > total):
+
+        if total is not None and (
+            total <= 0 or reconstructed > total
+        ):
             total = None
 
-        # Standard ETA formula using tqdm's EMA-smoothed rate.
+        # ETA based on tqdm's smoothed reconstruction rate.
         eta = None
+
         if total is not None:
-            if not receiving and completed == total:
+            if reconstructed == total:
                 eta = 0
-            elif speed is not None and speed > 0 and completed < total:
-                eta = (total - completed) / speed
+            elif write_speed is not None and write_speed > 0:
+                eta = (total - reconstructed) / write_speed
 
         return {
-            "phase": phase,
-            "completed": completed,
+            "phase": "Downloading",
+            "completed": reconstructed,
             "total": total,
-            "speed": speed,
-            "eta": eta,
+            "network_speed": network_speed,
+            "write_speed": write_speed,
             "files_done": int(files_done),
             "files_total": self.total_files,
+            "eta": eta,
         }
 
 
 # ── Layer 2: Rendering ────────────────────────────────────────
 
 class ProgressRenderer:
-    WIDTH = 14
+    WIDTH = 12
 
     @classmethod
     def render(cls, data):
@@ -130,36 +154,37 @@ class ProgressRenderer:
         completed = data["completed"]
         total = data["total"]
 
-        if total is not None:
+        if total is not None and total > 0:
             ratio = min(completed / total, 1.0)
             filled = round(cls.WIDTH * ratio)
 
             bar = "█" * filled + "░" * (cls.WIDTH - filled)
-            prefix = "≈" if phase == "Receiving" else ""
 
             progress = (
-                f"{bar} {prefix}{ratio:5.1%}"
-                f" | {format_bytes(completed)}/{prefix}{format_bytes(total)}"
+                f"{bar} {ratio:5.1%}"
+                f" | {format_bytes(completed)}/{format_bytes(total)}"
             )
         else:
             progress = f"{format_bytes(completed)} processed"
 
-        speed = data["speed"]
-        rate = (
-            f"{format_bytes(speed)}/s"
-            if speed is not None and speed > 0
-            else "--"
-        )
+        files = f"{data['files_done']}/{data['files_total']}"
 
-        eta = format_time(data["eta"])
-        if phase == "Receiving" and data["eta"] is not None:
-            eta = f"≈{eta}"
+        if phase == "Completed":
+            return f"Completed   {progress} | Files {files}"
+
+        def format_rate(speed):
+            return (
+                f"{format_bytes(speed)}/s"
+                if speed is not None and speed > 0
+                else "--"
+            )
 
         return (
-            f"{phase:<9} {progress}"
-            f" | {rate}"
-            f" | Files {data['files_done']}/{data['files_total']}"
-            f" | ETA {eta}"
+            f"Downloading {progress}"
+            f" | Net {format_rate(data['network_speed'])}"
+            f" | Write {format_rate(data['write_speed'])}"
+            f" | Files {files}"
+            f" | ETA {format_time(data['eta'])}"
         )
 
 
@@ -198,10 +223,12 @@ class DownloadProgress(tqdm):
         if self.kind != "overall" or self.tracker is None:
             return super().__str__()
 
-        return ProgressRenderer.render(self.tracker.snapshot())
+        return ProgressRenderer.render(
+            self.tracker.snapshot()
+        )
 
     def display(self, msg=None, pos=None):
-        # Only one tqdm object controls the terminal.
+        # Only the overall bar writes to the terminal.
         if self.kind == "overall":
             return super().display(msg=msg, pos=pos)
 
@@ -212,12 +239,14 @@ class DownloadProgress(tqdm):
     def update(self, n=1):
         result = super().update(n)
 
+        # Network and file events can refresh the main bar.
         if (
             self.kind != "overall"
             and self.tracker is not None
             and self.tracker.should_refresh()
         ):
             overall = self.tracker.get_bar("overall")
+
             if overall is not None:
                 overall.refresh()
 
@@ -235,6 +264,7 @@ class SilentProgress(tqdm):
 class Downloader:
     @staticmethod
     def run():
+        # Step 1: Configure download.
         options = {
             "repo_id": REPO_ID,
             "endpoint": DOWNLOAD_URL,
@@ -248,6 +278,7 @@ class Downloader:
         print(f"Target: {MODEL_DIR}")
         print("Checking files and cache...", flush=True)
 
+        # Step 2: Check remote files and local cache.
         plan = snapshot_download(
             **options,
             dry_run=True,
@@ -270,21 +301,32 @@ class Downloader:
         print(f"Data size: {format_bytes(total)}", flush=True)
 
         if not pending:
+            print("All files already cached.")
             return str(MODEL_DIR.resolve())
 
-        DownloadProgress.tracker = ProgressTracker(
+        # Step 3: Initialize progress statistics.
+        tracker = ProgressTracker(
             expected_bytes=total,
             total_files=len(plan),
         )
 
-        return snapshot_download(
+        DownloadProgress.tracker = tracker
+
+        # Step 4: Download and reconstruct files.
+        result = snapshot_download(
             **options,
             revision=plan[0].commit_hash,
             tqdm_class=DownloadProgress,
         )
 
+        # Step 5: Confirm completion.
+        tracker.finish()
+        tqdm.write(ProgressRenderer.render(tracker.snapshot()))
 
-# ── Entry point ───────────────────────────────────────────────
+        return result
+
+
+# ── Entry Point ───────────────────────────────────────────────
 
 def main():
     start = time.monotonic()
