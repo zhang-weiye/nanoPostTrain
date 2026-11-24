@@ -4,7 +4,11 @@ import sys
 from pathlib import Path
 
 from huggingface_hub import snapshot_download
+from huggingface_hub.errors import HfHubHTTPError, LocalEntryNotFoundError
 from huggingface_hub.utils import enable_progress_bars, tqdm
+
+
+MIRROR_ENDPOINT = "https://hf-mirror.com"
 
 
 class DownloadProgress(tqdm):
@@ -20,7 +24,20 @@ def main() -> None:
     model_dir = Path(__file__).resolve().parent.parent / "model"
     enable_progress_bars()
     print(f"Checking {repo_id} on Hugging Face…", file=sys.stderr, flush=True)
-    snapshot_download(repo_id=repo_id, local_dir=model_dir, tqdm_class=DownloadProgress)
+    download_options = {
+        "repo_id": repo_id,
+        "local_dir": model_dir,
+        "tqdm_class": DownloadProgress,
+    }
+    try:
+        snapshot_download(**download_options)
+    except (LocalEntryNotFoundError, HfHubHTTPError) as error:
+        if not isinstance(error, LocalEntryNotFoundError) and (
+            error.response is None or not 500 <= error.response.status_code < 600
+        ):
+            raise
+        print(f"Hugging Face is unavailable. Retrying via {MIRROR_ENDPOINT}…", file=sys.stderr, flush=True)
+        snapshot_download(**download_options, endpoint=MIRROR_ENDPOINT, token=False)
     print(f"Model files ready in {model_dir}")
 
 
