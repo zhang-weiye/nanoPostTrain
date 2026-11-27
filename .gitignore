@@ -220,7 +220,6 @@ __marimo__/
 .streamlit/secrets.toml
 
 
-# Download model parameters
-src/model
-src/modelcp
-src/modelcopy
+# Some Big Files
+/model
+/data
