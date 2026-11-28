@@ -16,3 +16,8 @@ torch = { index = "pytorch-cu132" }
 name = "pytorch-cu132"
 url = "https://download.pytorch.org/whl/cu132"
 explicit = true
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.4.0",
+]
